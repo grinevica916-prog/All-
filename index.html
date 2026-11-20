@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Deep Dream</title>
+<style>
+:root{--bg:#1e1536;--panel:#2a1f4a;--text:#f4ecff;--muted:#b8a8d9;--accent:#ff8fb8;--line:#4a3b78}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 Georgia,"Times New Roman",serif;padding:16px;max-width:640px;margin-inline:auto}
+h1{font-size:1.6rem;margin:.2em 0 .1em}
+p.sub{margin:0 0 16px;color:var(--muted)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+label{display:block;margin:10px 0 4px;color:var(--muted);font-size:.9rem}
+select,input[type=range]{width:100%}
+select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;font:inherit}
+button,.file{display:block;width:100%;text-align:center;padding:12px;border-radius:10px;border:0;font:inherit;font-weight:bold;cursor:pointer;margin-top:10px}
+button{background:var(--accent);color:#2a1030}
+button:disabled{opacity:.5}
+.file{background:var(--bg);color:var(--text);border:1px dashed var(--muted)}
+.file input{display:none}
+canvas{width:100%;height:auto;border-radius:10px;display:block;background:#000}
+#status{color:var(--muted);min-height:1.5em;margin:8px 0 0}
+a#dl{display:none;color:var(--accent);margin-top:10px;text-align:center}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+<h1>Deep Dream</h1>
+<p class="sub">Нейросеть дорисовывает на фото то, что «видит» в нём.</p>
+
+<div class="panel">
+  <label class="file">Выбрать фото<input id="file" type="file" accept="image/*"></label>
+
+  <label for="layer">Слой сети: глубже значит причудливее</label>
+  <select id="layer">
+    <option value="conv_pw_3_relu">3: линии и текстуры</option>
+    <option value="conv_pw_5_relu">5: узоры</option>
+    <option value="conv_pw_7_relu" selected>7: формы и глаза</option>
+    <option value="conv_pw_9_relu">9: странные существа</option>
+    <option value="conv_pw_11_relu">11: сложные образы</option>
+    <option value="conv_pw_13_relu">13: самые абстрактные</option>
+  </select>
+
+  <label for="alpha">Размер сети: больше значит красивее, но медленнее</label>
+  <select id="alpha">
+    <option value="0.25">0.25 (быстро)</option>
+    <option value="0.50" selected>0.50</option>
+    <option value="1.00">1.00 (долго)</option>
+  </select>
+
+  <label for="steps">Шагов на масштаб: <span id="stepsV">12</span></label>
+  <input id="steps" type="range" min="4" max="30" value="12">
+
+  <label for="lr">Сила: <span id="lrV">0.04</span></label>
+  <input id="lr" type="range" min="0.01" max="0.12" step="0.01" value="0.04">
+
+  <button id="go" disabled>Мечтать</button>
+  <p id="status">Выбери фото.</p>
+</div>
+
+<canvas id="out" width="4" height="4"></canvas>
+<a id="dl" download="dream.png">Сохранить картинку</a>
+
+<script>
+const TF_URLS = [
+  "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js",
+  "https://unpkg.com/@tensorflow/tfjs@4.22.0/dist/tf.min.js"
+];
+async function loadTf() {
+  if (window.tf) return;
+  for (const url of TF_URLS) {
+    try {
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = url; s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+      if (window.tf) return;
+    } catch (e) { /* пробуем следующий источник */ }
+  }
+  throw new Error('не удалось загрузить TensorFlow.js');
+}
+</script>
+<script>
+const $ = id => document.getElementById(id);
+const MAX_SIDE = 400, OCTAVES = 3, SCALE = 1.4;
+let srcCanvas = null, baseModel = null, baseAlpha = null;
+
+$('steps').oninput = e => $('stepsV').textContent = e.target.value;
+$('lr').oninput = e => $('lrV').textContent = e.target.value;
+
+$('file').onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    const k = Math.min(1, MAX_SIDE / Math.max(img.width, img.height));
+    const w = Math.round(img.width * k), h = Math.round(img.height * k);
+    srcCanvas = document.createElement('canvas');
+    srcCanvas.width = w; srcCanvas.height = h;
+    srcCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
+    const out = $('out');
+    out.width = w; out.height = h;
+    out.getContext('2d').drawImage(srcCanvas, 0, 0);
+    $('go').disabled = false;
+    $('dl').style.display = 'none';
+    $('status').textContent = 'Готово к запуску.';
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(f);
+};
+
+async function getSubModel(alpha, layer) {
+  if (!baseModel || baseAlpha !== alpha) {
+    if (baseModel) baseModel.dispose();
+    $('status').textContent = 'Загружаю MobileNet…';
+    const url = `https://storage.googleapis.com/tfjs-models/tfjs/mobilenet_v1_${alpha}_224/model.json`;
+    baseModel = await tf.loadLayersModel(url);
+    baseAlpha = alpha;
+  }
+  // MobileNet v1 идёт строго последовательно, поэтому берём слои по порядку
+  // и прогоняем через них картинку любого размера
+  const layers = baseModel.layers;
+  const idx = layers.findIndex(l => l.name === layer);
+  if (idx < 1) throw new Error('слой ' + layer + ' не найден');
+  return layers.slice(1, idx + 1);
+}
+
+async function dream() {
+  const btn = $('go');
+  btn.disabled = true;
+  try {
+    $('status').textContent = 'Загружаю TensorFlow.js…';
+    await loadTf();
+    await tf.ready();
+    const sub = await getSubModel($('alpha').value, $('layer').value);
+    const steps = +$('steps').value, lr = +$('lr').value;
+    const forward = x => {
+      let h = x;
+      for (const l of sub) h = l.apply(h);
+      return h;
+    };
+    const gradFn = tf.grad(x => forward(x).mean());
+
+    const orig = tf.tidy(() => tf.browser.fromPixels(srcCanvas).toFloat().div(127.5).sub(1).expandDims(0));
+    const H = orig.shape[1], W = orig.shape[2];
+    const shapes = [];
+    for (let i = OCTAVES - 1; i >= 0; i--) {
+      shapes.push([Math.max(32, Math.round(H / SCALE ** i)), Math.max(32, Math.round(W / SCALE ** i))]);
+    }
+
+    let x = tf.image.resizeBilinear(orig, shapes[0]);
+    let prevOrig = x;
+    const total = OCTAVES * steps;
+    let done = 0;
+
+    for (let o = 0; o < OCTAVES; o++) {
+      if (o > 0) {
+        // Увеличиваем результат и возвращаем детали оригинала
+        const next = tf.tidy(() => {
+          const up = tf.image.resizeBilinear(x, shapes[o]);
+          const origO = tf.image.resizeBilinear(orig, shapes[o]);
+          const lost = origO.sub(tf.image.resizeBilinear(prevOrig, shapes[o]));
+          return up.add(lost).clipByValue(-1, 1);
+        });
+        prevOrig.dispose(); x.dispose();
+        x = next;
+        prevOrig = tf.image.resizeBilinear(orig, shapes[o]);
+      }
+      for (let s = 0; s < steps; s++) {
+        const next = tf.tidy(() => {
+          const g = gradFn(x);
+          const step = g.div(g.abs().mean().add(1e-8)).mul(lr);
+          return x.add(step).clipByValue(-1, 1);
+        });
+        x.dispose();
+        x = next;
+        done++;
+        $('status').textContent = `Мечтаю… ${Math.round(done / total * 100)}%`;
+        await tf.nextFrame();
+      }
+    }
+
+    const shown = tf.tidy(() => x.add(1).div(2).clipByValue(0, 1).squeeze());
+    const out = $('out');
+    out.width = shown.shape[1]; out.height = shown.shape[0];
+    await tf.browser.toPixels(shown, out);
+    shown.dispose(); x.dispose(); prevOrig.dispose(); orig.dispose();
+
+    const dl = $('dl');
+    dl.href = out.toDataURL('image/png');
+    dl.style.display = 'block';
+    $('status').textContent = 'Готово. Можно сменить слой и запустить снова.';
+  } catch (err) {
+    console.error(err);
+    $('status').textContent = 'Ошибка: ' + err.message + '. Проверь интернет или уменьши размер сети.';
+  }
+  btn.disabled = false;
+}
+$('go').onclick = dream;
+</script>
+</body>
+</html>
